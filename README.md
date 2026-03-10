@@ -64,7 +64,7 @@ filtered_courses=[
 ```
 
 5.定时运行start.py(推荐使用宝塔面板定时任务，具体教程自行搜索)
-```python
+```bash
 python start.py
 ```
 

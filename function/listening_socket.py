@@ -19,11 +19,13 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
             print("下课了 关闭连接")
             ws.close()  # 关闭 WebSocket 连接
         # 定时监听当前进度
-        if "livestatus" not in message:
+        msg_json = json.loads(message)
+        action = msg_json.get("op")
+        if action == "fetchtimeline":
             # 检查返回timeline的最后一个（最新的时间）是否为problem，是则回答问题
-            time_lines = list(json.loads(message)["timeline"])
+            # time_lines = msg_json.get("timeline", [])
             # 过滤 time_lines["type"]!="problem"移除列表
-            time_lines = [item for item in time_lines if item.get("type") == "problem"]
+            time_lines = msg_json.get("unlockedproblem",[])
             # 最新的题目
             if len(time_lines) == 0:
                 # 没题可答，继续获取PPT内容，看看是否老师换了新的PPT文件
@@ -38,33 +40,31 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                 }
                 ws.send(json.dumps(auth_payload))
             else:
-                latest = time_lines[-1]
-                # if latest["type"] == "problem":
-                # 根据id进行检索已有的列表problem_list成员为dict,key["id"]为id
-                q_id = latest["prob"]
-                problem = problem_list.get(q_id)
-                if problem is not None:
-                    answer(
-                        problem_id=q_id,
-                        problem_type=problem["type"],
-                        problem_content=problem["content"],
-                        options=problem["options"],
-                        jwt=ppt_jwt,
-                        img_url=problem["img_url"]
-                    )
-                    # 移除回答完的问题
-                    if q_id in problem_list:
-                        del problem_list[q_id]
-                # 答题/检查完成后再次发送检查 直到(下课)关闭socket通道
-                ws.send(json.dumps({
-                    "op": "fetchtimeline",
-                    "lessonid": str(lesson_id),
-                    "msgid": 1
-                }))
+                for q_id in time_lines :
+                    # 根据id进行检索已有的列表problem_list成员为dict,key["id"]为id
+                    problem = problem_list.get(q_id)
+                    if problem is not None:
+                        answer(
+                            problem_id=q_id,
+                            problem_type=problem["type"],
+                            problem_content=problem["content"],
+                            options=problem["options"],
+                            jwt=ppt_jwt,
+                            img_url=problem["img_url"]
+                        )
+                        # 移除回答完的问题
+                        if q_id in problem_list:
+                            del problem_list[q_id]
+                    # 答题/检查完成后再次发送检查 直到(下课)关闭socket通道
+                    ws.send(json.dumps({
+                        "op": "fetchtimeline",
+                        "lessonid": str(lesson_id),
+                        "msgid": 1
+                    }))
             # 睡一会，别频率过头了被封
             time.sleep(sleep_second)
-            # 首次获取PPT内容，进而保存所有题目
         else:
+            # 首次获取PPT内容，进而保存所有题目
             # 解析出pres_id
             ppt_ids = set()
             if "timeline" in message:
@@ -121,7 +121,6 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                 "lessonid": str(lesson_id),
                 "msgid": 1
             }))
-
     return on_message
 
 
