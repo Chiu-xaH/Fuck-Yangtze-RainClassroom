@@ -29,8 +29,11 @@ def send_if_connected(ws, payload):
         return False
 
 
-def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second=10, stop_event=None):
+def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second=10,
+                       stop_event=None, answered_problem_ids=None):
     problem_list = dict()
+    if answered_problem_ids is None:
+        answered_problem_ids = set()
 
     def on_message(ws, message):
         # 下课 结束监听
@@ -68,8 +71,8 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                 for q_id in time_lines :
                     # 根据id进行检索已有的列表problem_list成员为dict,key["id"]为id
                     problem = problem_list.get(q_id)
-                    if problem is not None:
-                        answer(
+                    if problem is not None and q_id not in answered_problem_ids:
+                        answered = answer(
                             problem_id=q_id,
                             problem_type=problem["type"],
                             problem_content=problem["content"],
@@ -77,6 +80,8 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                             jwt=ppt_jwt,
                             img_url=problem["img_url"]
                         )
+                        if answered:
+                            answered_problem_ids.add(q_id)
                         # 移除回答完的问题
                         if q_id in problem_list:
                             del problem_list[q_id]
@@ -127,7 +132,7 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                                 options = question["options"]
 
                             answered = list(ppt["problem"]["answers"])
-                            if len(answered) == 0: # 回答完的问题不入队
+                            if len(answered) == 0 and question["problemId"] not in answered_problem_ids:
                                 # 保存
                                 save_dict = {
                                     "type": question["problemType"],
@@ -179,6 +184,7 @@ def on_open_connet(jwt, lesson_id, identity_id):
 def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id):
     stop_event = threading.Event()
     reconnect_attempt = 0
+    answered_problem_ids = set()
 
     while not stop_event.is_set():
         ws = websocket.WebSocketApp(
@@ -190,6 +196,7 @@ def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id):
                 identity_id=identity_id,
                 socket_jwt=socket_jwt,
                 stop_event=stop_event,
+                answered_problem_ids=answered_problem_ids,
             ),
             on_error=on_error,
             on_close=on_close,
@@ -251,6 +258,7 @@ def answer(problem_id, problem_type, jwt, problem_content, options,img_url):
 
     if response.status_code == 200:
         print("答题成功")
+        return True
     else:
         email_notice(content="答题失败，请手动前往雨课堂", subject="答题失败")
         print("答题失败")
@@ -259,3 +267,4 @@ def answer(problem_id, problem_type, jwt, problem_content, options,img_url):
             print("题目已经结束")
         else:
             print(msg)
+        return False
