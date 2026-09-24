@@ -266,7 +266,7 @@ def on_open_connet(jwt, lesson_id, identity_id):
 
 
 # 监听上课
-def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id):
+def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id, window_stop_event=None):
     stop_event = threading.Event()
     reconnect_attempt = 0
     answered_problem_ids = set()
@@ -274,7 +274,9 @@ def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id):
     seen_problem_ids = set()
     problem_state_lock = threading.Lock()
 
-    while not stop_event.is_set():
+    while not stop_event.is_set() and not (
+        window_stop_event is not None and window_stop_event.is_set()
+    ):
         on_message = on_message_connect(
             ppt_jwt=ppt_jwt,
             lesson_id=lesson_id,
@@ -293,15 +295,27 @@ def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id):
             on_error=on_error,
             on_close=on_close,
         )
+        connection_done = threading.Event()
+        if window_stop_event is not None:
+            def close_at_window_end():
+                while not connection_done.wait(0.5):
+                    if window_stop_event.is_set():
+                        ws.close()
+                        return
+
+            threading.Thread(target=close_at_window_end, daemon=True).start()
         try:
             ws.run_forever(
                 ping_interval=PING_INTERVAL_SECONDS,
                 ping_timeout=PING_TIMEOUT_SECONDS,
             )
         finally:
+            connection_done.set()
             on_message.stop_processing()
 
-        if stop_event.is_set():
+        if stop_event.is_set() or (
+            window_stop_event is not None and window_stop_event.is_set()
+        ):
             break
 
         reconnect_attempt += 1
@@ -309,11 +323,14 @@ def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id):
             f"WebSocket 连接中断，{RECONNECT_DELAY_SECONDS} 秒后重连（第 {reconnect_attempt} 次）",
             flush=True,
         )
-        stop_event.wait(RECONNECT_DELAY_SECONDS)
+        if window_stop_event is not None:
+            window_stop_event.wait(RECONNECT_DELAY_SECONDS)
+        else:
+            stop_event.wait(RECONNECT_DELAY_SECONDS)
 
 
 # 多线程 多个上课同时监听
-def start_all_sockets(on_lesson_list):
+def start_all_sockets(on_lesson_list, window_stop_event=None):
     threads = []
 
     for item in on_lesson_list:
@@ -323,11 +340,14 @@ def start_all_sockets(on_lesson_list):
                 "ppt_jwt": item["ppt_jwt"],
                 "socket_jwt": item["socket_jwt"],
                 "lesson_id": item["lesson_id"],
-                "identity_id": item["identity_id"]
+                "identity_id": item["identity_id"],
+                "window_stop_event": window_stop_event,
             }
         )
         t.start()
         threads.append(t)
+
+    return threads
 
     # for t in threads:
     #     t.join()  # 等待所有线程结束（如果需要）

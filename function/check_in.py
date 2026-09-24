@@ -10,7 +10,7 @@ from util.timestamp import get_now
 
 # 获取正在进行的
 def get_listening():
-    response = requests.get(host + api["get_listening"], headers=headers)
+    response = requests.get(host + api["get_listening"], headers=headers, timeout=15)
     if response.status_code == 200:
         response_data = response.json()
         return response_data["data"]
@@ -19,29 +19,38 @@ def get_listening():
 
 
 # 获取正在进行的课堂并且签到、写日志 新的签到方法
-def get_listening_classes_and_sign(filtered_courses: list):
+def get_listening_classes_and_sign(filtered_courses: list, seen_lesson_ids=None,
+                                   window_stop_event=None, quiet_when_empty=False):
     response = get_listening()
-    name = get_user_name()
+    name = None
 
     # 短期存储查看PPT用的JWT、lessonId等信息
     on_lesson_list = []
 
     if response is None:
-        return None
+        return []
     else:
         classes = list(response["onLessonClassrooms"])
         if len(classes) == 0:
-            print("\n无课")
-            return
+            if not quiet_when_empty:
+                print("\n无课")
+            return []
         else:
-            print("\n发现上课")
+            found_new_class = False
             for item in classes:
                 course_name = item["courseName"]
                 lesson_id = item["lessonId"]
+                if seen_lesson_ids is not None and lesson_id in seen_lesson_ids:
+                    continue
+                if not found_new_class:
+                    print("\n发现上课")
+                    found_new_class = True
                 response_sign = check_in_on_listening(lesson_id)
 
                 if response_sign.status_code == 200:
                     status = "签到成功"
+                    if name is None:
+                        name = get_user_name()
 
                     print(course_name, status)
                     data = response_sign.json()["data"]
@@ -77,13 +86,11 @@ def get_listening_classes_and_sign(filtered_courses: list):
                         "url": "https://changjiang.yuketang.cn/m/v2/lesson/student/" + str(lesson_id)
                     }
                     write_log(log_file_name, new_log)
+                    if seen_lesson_ids is not None:
+                        seen_lesson_ids.add(lesson_id)
                 else:
-                    print("失败", response_sign.status_code, response_sign.text)
-            # 所有签到完成后，进行死循环巡查，检查是否出现答题
-            start_all_sockets(on_lesson_list)
-
-            # for item in on_lesson_list:
-            #     start_socket_ppt(ppt_jwt=item["ppt_jwt"],socket_jwt=item["socket_jwt"], lesson_id=item["lesson_id"], identity_id=item["identity_id"])
+                    print("签到失败，HTTP", response_sign.status_code)
+            return start_all_sockets(on_lesson_list, window_stop_event=window_stop_event)
 
 
 # 获取正在进行的考试
@@ -112,7 +119,9 @@ def check_in_on_listening(lesson_id):
         "joinIfNotIn": True
     }
 
-    response_sign = requests.post(host + api["sign_in_class"], headers=headers, json=sign_data)
+    response_sign = requests.post(
+        host + api["sign_in_class"], headers=headers, json=sign_data, timeout=15
+    )
     return response_sign
 
 
