@@ -40,6 +40,53 @@ class FakeWebSocket:
 
 
 class ListeningSocketTests(unittest.TestCase):
+    def test_answered_question_is_not_reprocessed_after_reconnect(self):
+        answered_ids = set()
+        answer_calls = []
+        get_calls = []
+
+        class FakeResponse:
+            status_code = 200
+
+            def json(self):
+                return {"data": {"slides": [{
+                    "coverAlt": "",
+                    "problem": {
+                        "problemId": "q1",
+                        "problemType": 1,
+                        "body": "test question",
+                        "options": [],
+                        "answers": [],
+                    },
+                }]}}
+
+        original_get = listening_socket.requests.get
+        original_answer = listening_socket.answer
+        listening_socket.requests.get = lambda **kwargs: (get_calls.append(kwargs), FakeResponse())[1]
+        listening_socket.answer = lambda **kwargs: (answer_calls.append(kwargs), True)[1]
+        try:
+            for _ in range(2):
+                ws = FakeWebSocket()
+                on_message = listening_socket.on_message_connect(
+                    ppt_jwt="ppt",
+                    lesson_id="lesson",
+                    identity_id="user",
+                    socket_jwt="socket",
+                    sleep_second=0,
+                    answered_problem_ids=answered_ids,
+                )
+                on_message(ws, json.dumps({"op": "hello", "timeline": [
+                    {"type": "slide", "pres": "presentation"}
+                ]}))
+                on_message(ws, json.dumps({"op": "fetchtimeline", "unlockedproblem": ["q1"]}))
+        finally:
+            listening_socket.requests.get = original_get
+            listening_socket.answer = original_answer
+
+        self.assertEqual(2, len(get_calls))
+        self.assertEqual(1, len(answer_calls))
+        self.assertEqual({"q1"}, answered_ids)
+
     def test_notification_is_ignored_without_follow_up_send(self):
         ws = FakeWebSocket()
         on_message = listening_socket.on_message_connect(
