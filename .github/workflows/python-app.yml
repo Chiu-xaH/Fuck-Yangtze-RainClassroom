@@ -5,6 +5,9 @@ on:
     - cron: "*/5 * * * *"  # 固定尝试启动；实际窗口由 LISTEN_WINDOWS 决定
   workflow_dispatch:  # 允许手动触发
 
+permissions:
+  contents: read
+
 # 等待前面任务执行完成
 concurrency:
   group: scheduled-task
@@ -18,8 +21,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}  # 允许推送更改
 
       - name: Check listening window
         id: window
@@ -52,13 +53,3 @@ jobs:
             AI_KEY: ${{ secrets.AI_KEY }}
             ENNCY_KEY: ${{ secrets.ENNCY_KEY }}
             FILTERED_COURSES: ${{ secrets.FILTERED_COURSES }}
-
-
-      - name: Commit and push changes
-        if: ${{ steps.window.outputs.active == 'true' || github.event_name == 'workflow_dispatch' }}
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add .
-          git commit -m "Auto update logs" || echo "No changes to commit"
-          git push origin $(git rev-parse --abbrev-ref HEAD)
