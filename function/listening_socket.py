@@ -1,5 +1,5 @@
+import queue
 import threading
-import time
 
 import requests
 import websocket
@@ -30,25 +30,29 @@ def send_if_connected(ws, payload):
 
 
 def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second=10,
-                       stop_event=None, answered_problem_ids=None):
+                       stop_event=None, answered_problem_ids=None,
+                       processing_problem_ids=None, seen_problem_ids=None,
+                       problem_state_lock=None):
     problem_list = dict()
     if answered_problem_ids is None:
         answered_problem_ids = set()
+    if processing_problem_ids is None:
+        processing_problem_ids = set()
+    if seen_problem_ids is None:
+        seen_problem_ids = set()
+    if problem_state_lock is None:
+        problem_state_lock = threading.Lock()
+    processor_stop = threading.Event()
+    messages = queue.Queue()
+    reported_errors = set()
 
-    def on_message(ws, message):
-        # 下课 结束监听
-        if "lessonfinished" in message:
-            print("下课了，停止监听", flush=True)
-            if stop_event is not None:
-                stop_event.set()
-            ws.close()  # 关闭 WebSocket 连接
+    def stopped():
+        return processor_stop.is_set() or (stop_event is not None and stop_event.is_set())
+
+    def process_message(ws, msg_json):
+        if stopped():
             return
-        # 定时监听当前进度
-        msg_json = json.loads(message)
         action = msg_json.get("op")
-        if action == "notification":
-            print("收到 notification，继续监听", flush=True)
-            return
         if action == "fetchtimeline":
             # 检查返回timeline的最后一个（最新的时间）是否为problem，是则回答问题
             # time_lines = msg_json.get("timeline", [])
@@ -57,8 +61,8 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
             # 最新的题目
             if len(time_lines) == 0:
                 # 没题可答，继续获取PPT内容，看看是否老师换了新的PPT文件
-                print("目前无题目，休息片刻后重新获取PPT")
-                time.sleep(sleep_second)
+                if processor_stop.wait(sleep_second * 2) or stopped():
+                    return
                 auth_payload = {
                     "op": "hello",
                     "userid": identity_id,
@@ -68,56 +72,71 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                 }
                 send_if_connected(ws, auth_payload)
             else:
-                for q_id in time_lines :
+                for q_id in time_lines:
+                    if stopped():
+                        return
                     # 根据id进行检索已有的列表problem_list成员为dict,key["id"]为id
                     problem = problem_list.get(q_id)
-                    if problem is not None and q_id not in answered_problem_ids:
-                        answered = answer(
-                            problem_id=q_id,
-                            problem_type=problem["type"],
-                            problem_content=problem["content"],
-                            options=problem["options"],
-                            jwt=ppt_jwt,
-                            img_url=problem["img_url"]
-                        )
-                        if answered:
-                            answered_problem_ids.add(q_id)
+                    if problem is not None:
+                        with problem_state_lock:
+                            should_answer = (q_id not in answered_problem_ids
+                                             and q_id not in processing_problem_ids)
+                            if should_answer:
+                                processing_problem_ids.add(q_id)
+                        if should_answer:
+                            try:
+                                answered = answer(
+                                    problem_id=q_id,
+                                    problem_type=problem["type"],
+                                    problem_content=problem["content"],
+                                    options=problem["options"],
+                                    jwt=ppt_jwt,
+                                    img_url=problem["img_url"]
+                                )
+                                if answered:
+                                    with problem_state_lock:
+                                        answered_problem_ids.add(q_id)
+                            finally:
+                                with problem_state_lock:
+                                    processing_problem_ids.discard(q_id)
                         # 移除回答完的问题
                         if q_id in problem_list:
                             del problem_list[q_id]
-                    # 答题/检查完成后再次发送检查 直到(下课)关闭socket通道
-                    send_if_connected(ws, {
-                        "op": "fetchtimeline",
-                        "lessonid": str(lesson_id),
-                        "msgid": 1
-                    })
-            # 睡一会，别频率过头了被封
-            time.sleep(sleep_second)
+                # 整批处理后只发一次查询，避免多题时请求成倍增长
+                if processor_stop.wait(sleep_second) or stopped():
+                    return
+                send_if_connected(ws, {
+                    "op": "fetchtimeline",
+                    "lessonid": str(lesson_id),
+                    "msgid": 1
+                })
         else:
             # 首次获取PPT内容，进而保存所有题目
             # 解析出pres_id
             ppt_ids = set()
-            if "timeline" in message:
-                time_lines = list(json.loads(message)["timeline"])
+            if "timeline" in msg_json:
+                time_lines = list(msg_json["timeline"])
                 # 每一item中type=slide代表每一张PPT，拿到pres后，请求get_ppt接口拿到PPT具体内容，然后进行检测是否有problem
                 for item in time_lines:
                     # 是PPT
                     if item["type"] == "slide":
                         ppt_ids.add(item["pres"])
             else:
-                print("收到未处理的 WebSocket 消息，继续监听", flush=True)
                 return
             # 开始获取PPT
-            new_headers = headers
+            new_headers = headers.copy()
             new_headers["Authorization"] = "Bearer " + ppt_jwt
             new_headers["User-Agent"] = (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0")
 
+            new_problem_count = 0
             for pres_id in ppt_ids:
+                if stopped():
+                    return
                 url = host + api["get_ppt"].format(pres_id)
 
-                response = requests.get(headers=new_headers, url=url)
+                response = requests.get(headers=new_headers, url=url, timeout=15)
                 if response.status_code == 200:
                     ppt_pages = response.json()["data"]["slides"]
                     for ppt in ppt_pages:
@@ -132,7 +151,10 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                                 options = question["options"]
 
                             answered = list(ppt["problem"]["answers"])
-                            if len(answered) == 0 and question["problemId"] not in answered_problem_ids:
+                            with problem_state_lock:
+                                should_save = (question["problemId"] not in answered_problem_ids
+                                               and question["problemId"] not in processing_problem_ids)
+                            if len(answered) == 0 and should_save:
                                 # 保存
                                 save_dict = {
                                     "type": question["problemType"],
@@ -140,18 +162,81 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                                     "options": options,
                                     "img_url": ppt["coverAlt"]
                                 }
-                                print("保存题目", save_dict)
+                                with problem_state_lock:
+                                    if question["problemId"] not in seen_problem_ids:
+                                        seen_problem_ids.add(question["problemId"])
+                                        new_problem_count += 1
                                 problem_list[question["problemId"]] = save_dict
                 else:
-                    print("错误", response.status_code, response.content)
+                    print(f"获取 PPT 失败，HTTP {response.status_code}", flush=True)
             # 开始监听 定时发送
             # 这是发送一次
-            print("题目保存成功，切换至监听状态")
+            if new_problem_count:
+                print(f"发现 {new_problem_count} 道新题，继续监听", flush=True)
+            if stopped():
+                return
             send_if_connected(ws, {
                 "op": "fetchtimeline",
                 "lessonid": str(lesson_id),
                 "msgid": 1
             })
+
+    def process_queued_messages():
+        while True:
+            item = messages.get()
+            try:
+                if item is None:
+                    return
+                if not stopped():
+                    process_message(*item)
+                    reported_errors.clear()
+            except Exception as error:
+                error_name = type(error).__name__
+                if error_name not in reported_errors:
+                    print(f"监听消息处理失败: {error_name}，稍后重新获取课堂内容", flush=True)
+                    reported_errors.add(error_name)
+                if not stopped() and not processor_stop.wait(sleep_second * 2):
+                    ws, _ = item
+                    send_if_connected(ws, {
+                        "op": "hello",
+                        "userid": identity_id,
+                        "role": "student",
+                        "auth": socket_jwt,
+                        "lessonid": lesson_id,
+                    })
+            finally:
+                messages.task_done()
+
+    # 保持 WebSocket 的接收回调空闲，以便及时读取心跳回应。
+    worker = threading.Thread(target=process_queued_messages, daemon=True)
+    worker.start()
+
+    def on_message(ws, message):
+        if "lessonfinished" in message:
+            print("下课了，停止监听", flush=True)
+            if stop_event is not None:
+                stop_event.set()
+            processor_stop.set()
+            ws.close()
+            return
+        try:
+            msg_json = json.loads(message)
+        except json.JSONDecodeError:
+            print("收到无法解析的 WebSocket 消息", flush=True)
+            return
+        if not isinstance(msg_json, dict):
+            print("收到非对象 WebSocket 消息", flush=True)
+            return
+        if msg_json.get("op") == "notification" or stopped():
+            return
+        messages.put((ws, msg_json))
+
+    def stop_processing():
+        processor_stop.set()
+        messages.put(None)
+
+    on_message.stop_processing = stop_processing
+    on_message.pending_messages = messages
     return on_message
 
 
@@ -185,26 +270,36 @@ def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id):
     stop_event = threading.Event()
     reconnect_attempt = 0
     answered_problem_ids = set()
+    processing_problem_ids = set()
+    seen_problem_ids = set()
+    problem_state_lock = threading.Lock()
 
     while not stop_event.is_set():
+        on_message = on_message_connect(
+            ppt_jwt=ppt_jwt,
+            lesson_id=lesson_id,
+            identity_id=identity_id,
+            socket_jwt=socket_jwt,
+            stop_event=stop_event,
+            answered_problem_ids=answered_problem_ids,
+            processing_problem_ids=processing_problem_ids,
+            seen_problem_ids=seen_problem_ids,
+            problem_state_lock=problem_state_lock,
+        )
         ws = websocket.WebSocketApp(
             url=api["websocket"],
             on_open=on_open_connet(lesson_id=lesson_id, identity_id=identity_id, jwt=socket_jwt),
-            on_message=on_message_connect(
-                ppt_jwt=ppt_jwt,
-                lesson_id=lesson_id,
-                identity_id=identity_id,
-                socket_jwt=socket_jwt,
-                stop_event=stop_event,
-                answered_problem_ids=answered_problem_ids,
-            ),
+            on_message=on_message,
             on_error=on_error,
             on_close=on_close,
         )
-        ws.run_forever(
-            ping_interval=PING_INTERVAL_SECONDS,
-            ping_timeout=PING_TIMEOUT_SECONDS,
-        )
+        try:
+            ws.run_forever(
+                ping_interval=PING_INTERVAL_SECONDS,
+                ping_timeout=PING_TIMEOUT_SECONDS,
+            )
+        finally:
+            on_message.stop_processing()
 
         if stop_event.is_set():
             break
