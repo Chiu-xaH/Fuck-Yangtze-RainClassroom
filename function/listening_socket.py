@@ -9,18 +9,43 @@ from util.notice import email_notice
 from util.ai import request_ai
 from util.timestamp import get_date_time
 
+PING_INTERVAL_SECONDS = 30
+PING_TIMEOUT_SECONDS = 10
+RECONNECT_DELAY_SECONDS = 5
 
-def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second=10):
+
+def send_if_connected(ws, payload):
+    """Send a WebSocket payload only while the underlying connection is open."""
+    sock = getattr(ws, "sock", None)
+    if not getattr(sock, "connected", False):
+        print("WebSocket 未连接，跳过发送", flush=True)
+        return False
+
+    try:
+        ws.send(json.dumps(payload))
+        return True
+    except (OSError, websocket.WebSocketException) as error:
+        print(f"WebSocket 发送失败: {error!r}", flush=True)
+        return False
+
+
+def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second=10, stop_event=None):
     problem_list = dict()
 
     def on_message(ws, message):
         # 下课 结束监听
         if "lessonfinished" in message:
-            print("下课了 关闭连接")
+            print("下课了，停止监听", flush=True)
+            if stop_event is not None:
+                stop_event.set()
             ws.close()  # 关闭 WebSocket 连接
+            return
         # 定时监听当前进度
         msg_json = json.loads(message)
         action = msg_json.get("op")
+        if action == "notification":
+            print("收到 notification，继续监听", flush=True)
+            return
         if action == "fetchtimeline":
             # 检查返回timeline的最后一个（最新的时间）是否为problem，是则回答问题
             # time_lines = msg_json.get("timeline", [])
@@ -38,7 +63,7 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                     "auth": socket_jwt,
                     "lessonid": lesson_id
                 }
-                ws.send(json.dumps(auth_payload))
+                send_if_connected(ws, auth_payload)
             else:
                 for q_id in time_lines :
                     # 根据id进行检索已有的列表problem_list成员为dict,key["id"]为id
@@ -56,11 +81,11 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                         if q_id in problem_list:
                             del problem_list[q_id]
                     # 答题/检查完成后再次发送检查 直到(下课)关闭socket通道
-                    ws.send(json.dumps({
+                    send_if_connected(ws, {
                         "op": "fetchtimeline",
                         "lessonid": str(lesson_id),
                         "msgid": 1
-                    }))
+                    })
             # 睡一会，别频率过头了被封
             time.sleep(sleep_second)
         else:
@@ -75,7 +100,8 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
                     if item["type"] == "slide":
                         ppt_ids.add(item["pres"])
             else:
-                print("错误", message)
+                print("收到未处理的 WebSocket 消息，继续监听", flush=True)
+                return
             # 开始获取PPT
             new_headers = headers
             new_headers["Authorization"] = "Bearer " + ppt_jwt
@@ -116,20 +142,23 @@ def on_message_connect(ppt_jwt, lesson_id, identity_id, socket_jwt, sleep_second
             # 开始监听 定时发送
             # 这是发送一次
             print("题目保存成功，切换至监听状态")
-            ws.send(json.dumps({
+            send_if_connected(ws, {
                 "op": "fetchtimeline",
                 "lessonid": str(lesson_id),
                 "msgid": 1
-            }))
+            })
     return on_message
 
 
 def on_error(ws, error):
-    print("出错:", error)
+    print(f"WebSocket 错误: {error!r}", flush=True)
 
 
 def on_close(ws, close_status_code, close_msg):
-    return
+    print(
+        f"WebSocket 已关闭，code={close_status_code!r}, reason={close_msg!r}",
+        flush=True,
+    )
 
 
 def on_open_connet(jwt, lesson_id, identity_id):
@@ -141,23 +170,44 @@ def on_open_connet(jwt, lesson_id, identity_id):
             "auth": jwt,
             "lessonid": lesson_id
         }
-        ws.send(json.dumps(auth_payload))
+        send_if_connected(ws, auth_payload)
 
     return on_open
 
 
 # 监听上课
 def start_socket_ppt(ppt_jwt, socket_jwt, lesson_id, identity_id):
-    ws = websocket.WebSocketApp(
-        url=api["websocket"],
-        on_open=on_open_connet(lesson_id=lesson_id, identity_id=identity_id, jwt=socket_jwt),
-        on_message=on_message_connect(ppt_jwt=ppt_jwt, lesson_id=lesson_id, identity_id=identity_id,
-                                      socket_jwt=socket_jwt),
-        on_error=on_error,
-        on_close=on_close,
-    )
+    stop_event = threading.Event()
+    reconnect_attempt = 0
 
-    ws.run_forever()
+    while not stop_event.is_set():
+        ws = websocket.WebSocketApp(
+            url=api["websocket"],
+            on_open=on_open_connet(lesson_id=lesson_id, identity_id=identity_id, jwt=socket_jwt),
+            on_message=on_message_connect(
+                ppt_jwt=ppt_jwt,
+                lesson_id=lesson_id,
+                identity_id=identity_id,
+                socket_jwt=socket_jwt,
+                stop_event=stop_event,
+            ),
+            on_error=on_error,
+            on_close=on_close,
+        )
+        ws.run_forever(
+            ping_interval=PING_INTERVAL_SECONDS,
+            ping_timeout=PING_TIMEOUT_SECONDS,
+        )
+
+        if stop_event.is_set():
+            break
+
+        reconnect_attempt += 1
+        print(
+            f"WebSocket 连接中断，{RECONNECT_DELAY_SECONDS} 秒后重连（第 {reconnect_attempt} 次）",
+            flush=True,
+        )
+        stop_event.wait(RECONNECT_DELAY_SECONDS)
 
 
 # 多线程 多个上课同时监听
