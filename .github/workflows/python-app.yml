@@ -30,7 +30,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run script
-        run: python start.py
+        run: python -u start.py
         env:
             SESSION: ${{ secrets.SESSION }}
 #            EMAIL_USER: ${{ secrets.EMAIL_USER }}
